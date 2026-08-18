@@ -162,3 +162,5 @@ The one rule to know before you merge anything: **there is one release branch pe
 - **i18n**: 13 locales in `src/i18n/locales/<locale>/` (e.g. `src/i18n/locales/en/settings.json`). The `i18n:check` script validates them — run it after touching translation files.
 - **Build pipeline**: `npm run build` is full electron-builder. For iterating on renderer only, use `npm run build-vite` (Vite + tsc, no packaging).
 - **Product constraints**: the project is free forever and explicitly "not production-grade". Don't add paywalls, premium tiers, or logic that gates a feature on who the user is, and don't add upsell language to the README or UI copy. This is a hard constraint, not a judgement call. (A flag that hides an unfinished capture backend is fine — it gates on readiness, not on the user.)
+
+Fork note: this is a PlaybookMediaLLC fork. Read CLAUDE.md before you change code. <!-- fork-seam -->
