@@ -62,8 +62,9 @@ struct AudioInput {
 /// was silent while the microphone sat in a track nothing would ever select.
 ///
 /// The Windows helper has always written one mixed track
-/// (`mf_encoder.cpp` has a single `audioStreamIndex_`, fed by `AudioMixer`).
-/// This now matches it. macOS still has the two-track bug.
+/// (`mf_encoder.cpp` has a single `audioStreamIndex_`, fed by `AudioMixer`), and
+/// macOS has since done the same (`AudioTrackMixer` feeding the helper's single
+/// `AVAssetWriterInput(mediaType: .audio)`). All three now agree.
 struct AudioMix {
     inputs: Vec<AudioInput>,
     encoder: AudioEncoder,
@@ -191,6 +192,11 @@ pub struct Summary {
 
 pub struct Capture {
     encoder: VideoEncoder,
+    /// The dmabuf → VAAPI importer, present only on the zero-copy path (issue
+    /// #507). When set, [`Self::stage`] imports the frame's descriptor into an
+    /// NV12 surface instead of running swscale, and the encoder was opened
+    /// against this importer's pool.
+    importer: Option<crate::dmabuf_import::DmabufImporter>,
     video_track: TrackId,
     audio: Option<AudioMix>,
     /// `None` only between [`Self::finish`] taking it and the struct dropping.
@@ -221,6 +227,18 @@ pub struct Capture {
     committed_height: i32,
 }
 
+/// The outcome of staging one captured frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StageOutcome {
+    /// A new frame was staged; `advance` will encode it.
+    Staged,
+    /// A recoverable per-frame failure — one dmabuf the GPU could not map, or a
+    /// transient EAGAIN. The frame is skipped and `advance` holds the previously
+    /// staged one forward, so a single bad frame costs one frame, not the whole
+    /// recording. Carries the reason for a log warning.
+    Dropped(String),
+}
+
 impl Capture {
     pub fn start(
         path: &Path,
@@ -232,14 +250,51 @@ impl Capture {
         bitrate: Option<i64>,
         forced: Option<Backend>,
         audio_sources: Vec<AudioSource>,
+        // Present when the first frame is a tiled dmabuf: the encoder is then
+        // opened to consume the importer's NV12 pool directly (issue #507).
+        dmabuf: Option<&shim::DmabufDesc>,
     ) -> Result<(Self, Selection), String> {
         let bitrate = bitrate.unwrap_or_else(|| default_bitrate(width, height, fps));
         let mut rejected = Vec::new();
-        let encoder = VideoEncoder::open(
-            VideoParams { width, height, fps, bitrate },
-            forced,
-            |backend, error| rejected.push(format!("{}: {error}", backend.as_str())),
-        )?;
+        // Shared with the negotiation offer (`prefer_dmabuf` in main) so the two
+        // never disagree: offering dmabuf that this then refuses to import is what
+        // makes a forced-software recording fail on its first frame.
+        let use_dmabuf = crate::encoder::forced_allows_dmabuf(forced);
+        let (encoder, importer) = match dmabuf.filter(|_| use_dmabuf) {
+            Some(desc) => {
+                // The importer maps the full stream (`desc`) and its VPP crops to
+                // the committed record size (`width`/`height`): equal to the source
+                // for a monitor, or the window's crop rectangle for a window. The
+                // encoder is FORCED to VAAPI — the only backend that can consume the
+                // mapped surface; a non-VAAPI machine never negotiates dmabuf.
+                let importer = crate::dmabuf_import::DmabufImporter::new(
+                    desc.width,
+                    desc.height,
+                    width,
+                    height,
+                    desc.drm_fourcc,
+                )?;
+                // SAFETY: the importer's device and NV12 frames context are live
+                // for as long as the returned encoder, which the Capture owns
+                // alongside it below.
+                let encoder = unsafe {
+                    VideoEncoder::open_importing(
+                        VideoParams { width, height, fps, bitrate },
+                        importer.device(),
+                        importer.output_frames_ctx(),
+                    )?
+                };
+                (encoder, Some(importer))
+            }
+            None => {
+                let encoder = VideoEncoder::open(
+                    VideoParams { width, height, fps, bitrate },
+                    forced,
+                    |backend, error| rejected.push(format!("{}: {error}", backend.as_str())),
+                )?;
+                (encoder, None)
+            }
+        };
         let selection = Selection { backend: encoder.backend(), rejected };
 
         // Every track must exist before the header: MP4 fixes its track list
@@ -273,6 +328,7 @@ impl Capture {
         Ok((
             Self {
                 encoder,
+                importer,
                 video_track,
                 audio,
                 muxer: Some(muxer),
@@ -320,8 +376,50 @@ impl Capture {
     }
 
     /// Converts a captured frame into the encoder's staging buffer. Nothing is
-    /// written until [`Self::advance`] runs.
-    pub fn stage(&mut self, frame: &shim::Frame) -> Result<(), String> {
+    /// written until [`Self::advance`] runs. A recoverable per-frame failure (a
+    /// dmabuf the GPU cannot map) returns `Ok(Dropped)` rather than `Err`, so it
+    /// costs one frame, not the recording; a genuine encoder error still errors.
+    pub fn stage(&mut self, frame: &shim::Frame) -> Result<StageOutcome, String> {
+        // Zero-copy dmabuf path: import the tiled GPU buffer into an NV12 VAAPI
+        // surface (the VPP crops a window to its committed rectangle) and hand it
+        // to the encoder as-is — no swscale. See issue #507.
+        if frame.dmabuf.is_some() {
+            // The crop origin, clamped to stay inside the buffer — same rule as the
+            // CPU path. Computed before the mutable importer borrow. For a monitor
+            // this is (0, 0).
+            let (crop_x, crop_y) = self.read_origin(frame);
+            let desc = frame.dmabuf.as_ref().expect("checked is_some above");
+            let importer = self
+                .importer
+                .as_mut()
+                .ok_or_else(|| "dmabuf frame arrived but no importer was built".to_owned())?;
+            // Borrow the descriptor's planes directly — they are already
+            // `shim::DmabufPlane`, the exact type `import` takes — instead of
+            // reallocating a plane vector on every frame.
+            let nv12 = match importer.import(
+                &crate::dmabuf_import::DmabufFrame {
+                    width: desc.width,
+                    height: desc.height,
+                    drm_fourcc: desc.drm_fourcc,
+                    modifier: desc.modifier,
+                    planes: &desc.planes,
+                },
+                crop_x,
+                crop_y,
+            ) {
+                Ok(nv12) => nv12,
+                // A single un-mappable buffer must not end the recording. Skip it;
+                // `advance` holds the previous frame, and the shm path is still in
+                // the offer for a full downgrade later (a planned follow-up).
+                Err(reason) => return Ok(StageOutcome::Dropped(reason)),
+            };
+            // SAFETY: `nv12` is a VAAPI NV12 frame from the pool the encoder was
+            // opened against; the encoder takes ownership.
+            unsafe { self.encoder.stage_hw(nv12) };
+            self.mark_started();
+            return Ok(StageOutcome::Staged);
+        }
+
         let format = pixel_format(frame.video_format)?;
 
         // Address the crop by moving the START of the slice, and hand swscale the
@@ -340,21 +438,28 @@ impl Capture {
             .ok_or_else(|| format!("crop offset {offset} is past the end of the frame"))?;
 
         self.encoder.stage(pixels, frame.stride, format)?;
-        if self.epoch.is_none() {
-            self.epoch = Some(Instant::now());
-            // Audio has been accumulating since the process started, while the
-            // portal picker was up and the format was being negotiated. None of
-            // it belongs to the recording: video frame 0 is now, so audio
-            // sample 0 is now too. Keeping the backlog would shift the whole
-            // track earlier by however long the user took to click.
-            if let Some(mix) = &mut self.audio {
-                for input in &mut mix.inputs {
-                    input.ring.clear();
-                    input.pending.clear();
-                }
+        self.mark_started();
+        Ok(StageOutcome::Staged)
+    }
+
+    /// Starts the timeline on the first staged frame and drops the audio backlog.
+    ///
+    /// Audio has been accumulating since the process started, while the portal
+    /// picker was up and the format was being negotiated. None of it belongs to
+    /// the recording: video frame 0 is now, so audio sample 0 is now too. Keeping
+    /// the backlog would shift the whole track earlier by however long the user
+    /// took to click.
+    fn mark_started(&mut self) {
+        if self.epoch.is_some() {
+            return;
+        }
+        self.epoch = Some(Instant::now());
+        if let Some(mix) = &mut self.audio {
+            for input in &mut mix.inputs {
+                input.ring.clear();
+                input.pending.clear();
             }
         }
-        Ok(())
     }
 
     /// Whether a picture has been staged, which is also whether the timeline has
@@ -396,20 +501,39 @@ impl Capture {
     pub fn pause(&mut self) {
         if self.paused_at.is_none() {
             self.paused_at = Some(Instant::now());
+            // The rings stop taking samples for the duration. What they already
+            // hold is audio from before the pause: it is part of the take and
+            // stays, and the first drain after resume places it. See
+            // AudioRing::pause for what discarding it used to cost.
+            //
+            // THE CLOCK IS STOPPED FIRST, AND THAT ORDER IS THE RIGHT WAY ROUND.
+            // It leaves a window of a microsecond or so in which a capture
+            // thread can still be admitted — but a PipeWire buffer is delivered
+            // AFTER the audio in it was captured, so a buffer arriving in that
+            // window carries sound from before the pause instant, which the
+            // video timeline does cover. Keeping it is correct. Closing the
+            // gates first would reject that same buffer instead, and a
+            // rejection owes no silence, so it would drop a quantum of audio
+            // the video still accounts for — the same error, in the direction
+            // that actually loses something.
+            if let Some(mix) = &mut self.audio {
+                for input in &mut mix.inputs {
+                    input.ring.pause();
+                }
+            }
         }
     }
 
     pub fn resume(&mut self) {
         if let Some(since) = self.paused_at.take() {
             self.paused_total += since.elapsed();
-            // Whatever arrived while paused is thrown away rather than encoded:
-            // the video timeline did not advance across the pause, so keeping
-            // the audio would push every later sample out of sync by the length
-            // of the pause.
+            // Nothing was captured while paused, so there is nothing here to
+            // throw away — the rings only have to start taking samples again.
+            // `pending` is left alone for the same reason the rings are: it
+            // holds samples drained before the pause, which are take audio.
             if let Some(mix) = &mut self.audio {
                 for input in &mut mix.inputs {
-                    input.ring.clear();
-                    input.pending.clear();
+                    input.ring.resume();
                 }
             }
         }
@@ -526,6 +650,7 @@ mod tests {
             pts_ns: -1,
             crop: shim::CropRect { x: 0, y: 0, width, height },
             has_crop: false,
+            dmabuf: None,
         }
     }
 
@@ -570,7 +695,7 @@ mod tests {
     fn the_timeline_does_not_start_until_the_first_frame_is_staged() {
         let output = std::env::temp_dir().join("openscreen-capture-epoch.mp4");
         let (mut capture, _) =
-            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new())
+            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new(), None)
                 .expect("start");
         assert!(!capture.started());
         // Nothing staged: advance must not write a frame of uninitialised memory.
@@ -589,7 +714,7 @@ mod tests {
         // further arrivals, and the file must still fill with frames.
         let output = std::env::temp_dir().join("openscreen-capture-static.mp4");
         let (mut capture, _) =
-            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new())
+            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new(), None)
                 .expect("start");
         capture
             .stage(&frame(320, 240, shim::constants().video_format_bgrx))
@@ -614,7 +739,7 @@ mod tests {
     fn a_window_is_staged_from_its_crop_inside_a_larger_frame() {
         let output = std::env::temp_dir().join("openscreen-capture-crop.mp4");
         let (mut capture, _) =
-            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new())
+            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new(), None)
                 .expect("start");
 
         // A 1920x1080 stream carrying a 320x240 window at (100, 50).
@@ -645,7 +770,7 @@ mod tests {
     fn a_crop_against_the_right_edge_is_not_rejected_as_truncated() {
         let output = std::env::temp_dir().join("openscreen-capture-edge.mp4");
         let (mut capture, _) =
-            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new())
+            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new(), None)
                 .expect("start");
 
         let staged = capture.stage(&cropped_frame(
@@ -668,7 +793,7 @@ mod tests {
     fn a_shrunken_window_is_read_from_inside_the_frame() {
         let output = std::env::temp_dir().join("openscreen-capture-shrunk.mp4");
         let (mut capture, _) =
-            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new())
+            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new(), None)
                 .expect("start");
 
         // Origin so close to the edge that a 320x240 read from it would overrun.
@@ -694,7 +819,7 @@ mod tests {
         let output = std::env::temp_dir().join("openscreen-capture-odd.mp4");
         // 321x241 rounds to the 320x240 the encoder is opened at.
         let (mut capture, _) =
-            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new())
+            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new(), None)
                 .expect("start");
 
         let frame = cropped_frame(
@@ -713,7 +838,7 @@ mod tests {
     fn an_uncropped_frame_reports_no_divergence() {
         let output = std::env::temp_dir().join("openscreen-capture-nocrop.mp4");
         let (mut capture, _) =
-            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new())
+            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new(), None)
                 .expect("start");
 
         assert!(!capture.crop_diverged(&frame(320, 240, shim::constants().video_format_bgrx)));
@@ -725,7 +850,7 @@ mod tests {
     fn paused_time_does_not_advance_the_timeline() {
         let output = std::env::temp_dir().join("openscreen-capture-pause.mp4");
         let (mut capture, _) =
-            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new())
+            Capture::start(&output, 320, 240, 30, Some(1_000_000), Some(Backend::Software), Vec::new(), None)
                 .expect("start");
         capture
             .stage(&frame(320, 240, shim::constants().video_format_bgrx))
@@ -765,6 +890,7 @@ mod tests {
             Some(1_000_000),
             Some(Backend::Software),
             vec![AudioSource { label: "system", ring: ring.clone(), gain: 1.0, bitrate: 128_000 }],
+            None,
         )
         .expect("start");
 
@@ -778,6 +904,52 @@ mod tests {
             "pre-roll overflow must not be reported as the encoder falling behind"
         );
         assert!(capture.dropped_audio().is_empty());
+        let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn a_real_drop_before_a_pause_still_reaches_the_warning_after_it() {
+        // Regression: resume() threw away what arrived during the pause by
+        // clearing the ring, and the clear reset `dropped` — so an overflow that
+        // happened for real earlier in the take was forgotten, and the
+        // `audio-dropped` warning (main.rs) never fired for it. Pausing is the
+        // only thing between the user and the only report that a recording lost
+        // audio.
+        let ring = Arc::new(AudioRing::new(1, 8, AUDIO_CHANNELS));
+        let capacity = 1 * 8 * AUDIO_CHANNELS;
+
+        let output = std::env::temp_dir().join("openscreen-capture-audio-pause-drop.mp4");
+        let (mut capture, _) = Capture::start(
+            &output,
+            320,
+            240,
+            30,
+            Some(1_000_000),
+            Some(Backend::Software),
+            vec![AudioSource { label: "system", ring: ring.clone(), gain: 1.0, bitrate: 128_000 }],
+            None,
+        )
+        .expect("start");
+        capture
+            .stage(&frame(320, 240, shim::constants().video_format_bgrx))
+            .expect("stage");
+
+        // Mid-take: the encoder falls far enough behind that the ring overflows.
+        ring.push_for_test(&vec![0.5; capacity * 3]);
+        let dropped = ring.dropped_samples();
+        assert!(dropped > 0, "the ring must have overflowed for this test to mean anything");
+
+        capture.pause();
+        // A long pause. Nothing that arrives during it belongs to the recording,
+        // and none of it is the encoder falling behind either.
+        ring.push_for_test(&vec![0.5; capacity * 10]);
+        capture.resume();
+
+        assert_eq!(
+            capture.dropped_audio(),
+            vec![("system", dropped)],
+            "the pause must not spend the tally of a drop that happened before it"
+        );
         let _ = std::fs::remove_file(&output);
     }
 
@@ -798,6 +970,7 @@ mod tests {
             Some(1_000_000),
             Some(Backend::Software),
             vec![AudioSource { label: "microphone", ring, gain: 4.0, bitrate: 128_000 }],
+            None,
         )
         .expect("start");
         capture
@@ -837,6 +1010,7 @@ mod tests {
                 AudioSource { label: "system", ring: system.clone(), gain: 1.0, bitrate: 128_000 },
                 AudioSource { label: "microphone", ring: mic.clone(), gain: 1.0, bitrate: 128_000 },
             ],
+            None,
         )
         .expect("start");
 
@@ -886,6 +1060,7 @@ mod tests {
                 AudioSource { label: "system", ring: system.clone(), gain: 1.0, bitrate: 128_000 },
                 AudioSource { label: "microphone", ring: dead, gain: 1.0, bitrate: 128_000 },
             ],
+            None,
         )
         .expect("start");
         capture
@@ -909,7 +1084,7 @@ mod tests {
     fn catch_up_is_bounded_so_a_stall_cannot_block_stop() {
         let output = std::env::temp_dir().join("openscreen-capture-catchup.mp4");
         let (mut capture, _) =
-            Capture::start(&output, 320, 240, 60, Some(1_000_000), Some(Backend::Software), Vec::new())
+            Capture::start(&output, 320, 240, 60, Some(1_000_000), Some(Backend::Software), Vec::new(), None)
                 .expect("start");
         capture
             .stage(&frame(320, 240, shim::constants().video_format_bgrx))
