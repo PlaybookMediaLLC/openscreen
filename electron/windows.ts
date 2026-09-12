@@ -1,6 +1,13 @@
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { BrowserWindow, ipcMain, screen } from "electron";
+import { app, BrowserWindow, ipcMain, screen } from "electron";
+import {
+	clampRectToWorkArea,
+	loadEditorWindowState,
+	resolveEditorCreation,
+	saveEditorWindowState,
+	shouldTrackEditorWindow,
+} from "./editorWindowState";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -46,12 +53,9 @@ const CONTENT_PROTECTION_FORCED = process.env["OPENSCREEN_FORCE_CONTENT_PROTECTI
  * older macOS — where it may well work — would be a privacy regression made on
  * no evidence.
  *
- * NOTE: this leaves the HUD capturable on macOS 26. Apple already made that
- * partly true regardless — ScreenCaptureKit ignores `sharingType`, so any
- * SCK-based recorder (including *ours*, see
- * `electron/native/screencapturekit/`) captures these windows anyway. The
- * durable fix is to exclude our own windows via `SCContentFilter`'s
- * `excludingWindows:`, which that helper currently passes as `[]`.
+ * ScreenCaptureKit ignores `sharingType`, so the native recorder independently
+ * excludes the HUD and Notes windows by their native IDs. This call remains the
+ * Windows protection and a second line of defence on older macOS releases.
  */
 const CONTENT_PROTECTION_BREAKS_DISPLAY = (() => {
 	if (process.platform !== "darwin") return false;
@@ -392,10 +396,18 @@ export function createHudOverlayWindow(): BrowserWindow {
  */
 export function createEditorWindow(query: Record<string, string> = {}): BrowserWindow {
 	const isMac = process.platform === "darwin";
+	const persist = shouldTrackEditorWindow(query);
+	const loaded = persist ? loadEditorWindowState(app.getPath("userData")) : null;
+	const saved = loaded
+		? {
+				...clampRectToWorkArea(loaded, screen.getDisplayMatching(loaded).workArea),
+				maximized: loaded.maximized,
+			}
+		: null;
+	const creation = resolveEditorCreation({ isBench: query.windowType === "bench", saved });
 
 	const win = new BrowserWindow({
-		width: 1200,
-		height: 800,
+		...creation.bounds,
 		minWidth: 800,
 		minHeight: 600,
 		// Seamless titlebar on every platform: the app's own topbar IS the titlebar
@@ -425,7 +437,23 @@ export function createEditorWindow(query: Record<string, string> = {}): BrowserW
 		},
 	});
 
-	win.maximize();
+	if (creation.maximize) win.maximize();
+	if (creation.persist) {
+		const persistState = () => {
+			if (win.isDestroyed()) return;
+			const bounds = win.getNormalBounds();
+			saveEditorWindowState(app.getPath("userData"), {
+				x: bounds.x,
+				y: bounds.y,
+				width: bounds.width,
+				height: bounds.height,
+				maximized: win.isMaximized(),
+			});
+		};
+		win.on("moved", persistState);
+		win.on("resized", persistState);
+		win.on("close", persistState);
+	}
 
 	// The editor renders its own File/Edit/View menu bar in the custom titlebar,
 	// so hide the native OS menu bar on Windows/Linux (it stays reachable via Alt).

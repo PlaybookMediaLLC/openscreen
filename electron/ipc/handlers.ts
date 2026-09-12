@@ -16,11 +16,15 @@ import {
 	shell,
 	systemPreferences,
 } from "electron";
+import type { AxcutDocument } from "../../src/lib/ai-edition/schema";
 import {
 	type NativeLinuxRecordingRequest,
 	portalCursorMode,
 } from "../../src/lib/nativeLinuxRecording";
-import type { NativeMacRecordingRequest } from "../../src/lib/nativeMacRecording";
+import {
+	collectMacCaptureExcludedWindowIds,
+	type NativeMacRecordingRequest,
+} from "../../src/lib/nativeMacRecording";
 import type { NativeWindowsRecordingRequest } from "../../src/lib/nativeWindowsRecording";
 import {
 	type CursorCaptureMode,
@@ -69,7 +73,10 @@ import {
 	LinuxNativeCaptureSession,
 } from "../native-bridge/capture/linuxNativeCaptureSession";
 import { createCursorRecordingSession } from "../native-bridge/cursor/recording/factory";
-import { requestMacCursorAccessibilityAccess } from "../native-bridge/cursor/recording/macNativeCursorRecordingSession";
+import {
+	isMacCursorHelperUnavailable,
+	requestMacCursorAccessibilityAccess,
+} from "../native-bridge/cursor/recording/macNativeCursorRecordingSession";
 import { findPipeWireCursorHelperPath } from "../native-bridge/cursor/recording/pipeWireCursorRecordingSession";
 import type { CursorRecordingSession } from "../native-bridge/cursor/recording/session";
 import { toHelperRect } from "../native-bridge/helperCoordinates";
@@ -86,6 +93,7 @@ import {
 import { patchWebmDurationOnDisk } from "../recording/webm-duration";
 import { reindexRecordingOnDisk } from "../recording/webm-seek-index";
 import { registerNativeBridgeHandlers } from "./nativeBridge";
+import { registerRecordingPrefsHandlers } from "./recordingPrefs";
 import { RecordingStreamRegistry, registerRecordingStreamHandlers } from "./recordingStream";
 
 const PROJECT_FILE_EXTENSION = "openscreen";
@@ -104,6 +112,9 @@ const ALLOWED_IMPORT_VIDEO_EXTENSIONS = new Set([
 	".ts",
 ]);
 const PREVIEW_AUDIO_DIR = path.join(app.getPath("userData"), "preview-audio");
+// See the save-recorded-voiceover handler: an upper bound on renderer-supplied
+// bytes written to disk, well past any plausible take.
+const MAX_RECORDED_VOICEOVER_BYTES = 512 * 1024 * 1024;
 const nativeMacCaptureEvents = new EventEmitter();
 
 // Enumeration walks every display and window and grabs a thumbnail of each, so it
@@ -181,6 +192,34 @@ function buildDialogOptions<T extends Electron.OpenDialogOptions | Electron.Save
 
 function hasAllowedImportVideoExtension(filePath: string): boolean {
 	return ALLOWED_IMPORT_VIDEO_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+// Imported audio (issue #350). Kept separate from the video set so the two
+// pickers stay honest — an audio picker must not approve a video path and vice
+// versa. A SUBSET of SUPPORTED_AUDIO_EXTENSIONS in the document service, which
+// also accepts `.webm`: that gate is told the kind by its caller, while this one
+// only has the extension to go on and `.webm` is far more often a video.
+const ALLOWED_IMPORT_AUDIO_EXTENSIONS = new Set([
+	".mp3",
+	".wav",
+	".m4a",
+	".aac",
+	".flac",
+	".ogg",
+	".opus",
+]);
+
+function hasAllowedImportAudioExtension(filePath: string): boolean {
+	return ALLOWED_IMPORT_AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+// Video OR audio. The type-specific pickers stay honest (see the audio set's
+// comment), but the generic media READS — peaks, binary, file-info, chunk — serve
+// whichever kind the document points at, so they must accept both. Gating them on
+// video alone dropped every imported audio path once `approvedPaths` was empty
+// (a project reopen), and the waveform was lost for good (issue #350).
+function hasAllowedImportMediaExtension(filePath: string): boolean {
+	return hasAllowedImportVideoExtension(filePath) || hasAllowedImportAudioExtension(filePath);
 }
 
 function runProcess(
@@ -279,8 +318,13 @@ async function prepareSupplementalPreviewAudioTrack(videoPath: string) {
 	return { success: true, path: pathToFileURL(outputPath).toString() };
 }
 
-async function approveReadableVideoPath(
-	filePath?: string | null,
+// Shared core behind the media path approvers. `hasAllowedExtension` is the ONLY
+// thing that differs between video and audio imports, so it is the single knob:
+// an already-approved path passes regardless, otherwise the extension gate,
+// optional trusted-dir confinement, and a stat check decide whether to approve.
+async function approveReadableMediaPath(
+	filePath: string | null | undefined,
+	hasAllowedExtension: (p: string) => boolean,
 	trustedDirs?: string[],
 ): Promise<string | null> {
 	const normalizedPath = normalizeVideoSourcePath(filePath);
@@ -292,7 +336,7 @@ async function approveReadableVideoPath(
 		return normalizedPath;
 	}
 
-	if (!hasAllowedImportVideoExtension(normalizedPath)) {
+	if (!hasAllowedExtension(normalizedPath)) {
 		return null;
 	}
 
@@ -317,6 +361,53 @@ async function approveReadableVideoPath(
 
 	approveFilePath(normalizedPath);
 	return normalizedPath;
+}
+
+function approveReadableVideoPath(
+	filePath?: string | null,
+	trustedDirs?: string[],
+): Promise<string | null> {
+	return approveReadableMediaPath(filePath, hasAllowedImportVideoExtension, trustedDirs);
+}
+
+function approveReadableAudioPath(
+	filePath?: string | null,
+	trustedDirs?: string[],
+): Promise<string | null> {
+	return approveReadableMediaPath(filePath, hasAllowedImportAudioExtension, trustedDirs);
+}
+
+/**
+ * A path a generic read may use — and NOT a way to obtain one.
+ *
+ * `approveReadableMediaPath` grants approval to any existing file with a media extension.
+ * Behind a picker or a document load that is the point; behind `read-binary-file` it meant
+ * the renderer could name any media file on the machine and have its bytes handed back,
+ * which is a capability no generic handler should carry (CWE-200).
+ *
+ * Approval is granted in exactly three places now: the recordings directory, a file the user
+ * picked, and the assets a loaded project declares (`approveDocumentMedia`). Everything else
+ * spends one.
+ */
+function readableApprovedPath(filePath?: string | null): string | null {
+	const normalizedPath = normalizeVideoSourcePath(filePath);
+	if (!normalizedPath) return null;
+	if (!isPathAllowed(normalizedPath)) return null;
+	// The extension check stays: an approval granted for a recording must not become a way
+	// to read the project file, the log, or anything else sitting beside it.
+	if (!hasAllowedImportMediaExtension(normalizedPath)) return null;
+	return normalizedPath;
+}
+
+/** Grant the media a loaded project declares. The document is the app's own file, and this
+ *  is what the picker's approval decays into once the app restarts. */
+function approveDocumentMedia(document: AxcutDocument): void {
+	for (const asset of document.assets ?? []) {
+		const media = normalizeVideoSourcePath(asset.originalPath);
+		if (media && hasAllowedImportMediaExtension(media)) approveFilePath(media);
+		const camera = normalizeVideoSourcePath(asset.cameraTrack?.sourcePath);
+		if (camera && hasAllowedImportMediaExtension(camera)) approveFilePath(camera);
+	}
 }
 
 function resolveRecordingOutputPath(fileName: string): string {
@@ -497,8 +588,8 @@ let currentRecordingSession: RecordingSession | null = null;
 // useScreenRecorder (a separate renderer, own process, own React tree) picks
 // up those choices instead of silently reverting to its own defaults when
 // startNewRecording() switches windows. Mirrors the selectedSource pattern
-// above (in-memory, broadcast on change) rather than persisting to disk —
-// this is a live session preference, not project content.
+// above (in-memory, broadcast on change). Auto-zoom is the one durable choice;
+// the device selections remain session preferences, not project content.
 export interface RecordingPrefs {
 	micEnabled: boolean;
 	micDeviceId: string | null;
@@ -518,8 +609,10 @@ export interface RecordingPrefs {
 	camDeviceId: string | null;
 	systemAudioEnabled: boolean;
 	cursorCaptureMode: CursorCaptureMode;
+	/** After a take, suggest cursor-dwell zooms. Default on, matching 1.5. */
+	autoZoomEnabled: boolean;
 }
-let recordingPrefs: RecordingPrefs = {
+const defaultRecordingPrefs: RecordingPrefs = {
 	micEnabled: false,
 	micDeviceId: null,
 	micDeviceName: null,
@@ -527,6 +620,7 @@ let recordingPrefs: RecordingPrefs = {
 	camDeviceId: null,
 	systemAudioEnabled: false,
 	cursorCaptureMode: "editable-overlay",
+	autoZoomEnabled: true,
 };
 
 // Cached source from the user's pick. Used by setDisplayMediaRequestHandler in main.ts for cursor-free capture.
@@ -1861,18 +1955,7 @@ export function registerIpcHandlers(
 		return selectedSource;
 	});
 
-	ipcMain.handle("get-recording-prefs", () => {
-		return recordingPrefs;
-	});
-
-	ipcMain.handle("set-recording-prefs", (_, prefs: Partial<RecordingPrefs>) => {
-		recordingPrefs = { ...recordingPrefs, ...prefs };
-		const mainWin = getMainWindow();
-		if (mainWin && !mainWin.isDestroyed()) {
-			mainWin.webContents.send("recording-prefs-changed", recordingPrefs);
-		}
-		return recordingPrefs;
-	});
+	registerRecordingPrefsHandlers(defaultRecordingPrefs, getMainWindow);
 
 	ipcMain.handle("request-camera-access", async () => {
 		if (process.platform !== "darwin") {
@@ -1913,14 +1996,27 @@ export function registerIpcHandlers(
 	ipcMain.handle("request-native-mac-cursor-access", async () => {
 		const access = await requestMacCursorAccessibilityAccess();
 
-		// When the editable cursor can't get Accessibility trust, pop a native dialog
-		// that deep-links to the Accessibility pane (mirrors the Screen Recording flow).
+		// Pop the native Accessibility dialog ONLY for a genuine denial — the helper ran,
+		// asked, and was told no. Every other !granted status means the helper never got
+		// to ask (absent from the build, killed by the loader, crashed, hung), and telling
+		// the user to grant a permission they may well already hold is what made #515
+		// impossible to escape. Those degrade silently instead; the recorder falls back to
+		// position-only cursor telemetry and the countdown still runs.
 		if (process.platform === "darwin" && !access.granted) {
+			if (isMacCursorHelperUnavailable(access.status)) {
+				console.warn(
+					`[cursor-macos] editable cursor unavailable (status=${access.status}${
+						access.error ? `, error=${access.error}` : ""
+					}); the app ${
+						access.accessibilityTrusted ? "does" : "does not"
+					} hold Accessibility trust. Recording continues with position-only cursor telemetry.`,
+				);
+				return access;
+			}
+
 			const mainWin = getMainWindow();
 			const detail =
-				access.status === "missing-helper"
-					? "The cursor helper couldn't be found in this build, so the editable cursor can't be enabled. Rebuild the native helper (npm run build:native:mac) or switch the HUD cursor mode to system."
-					: "Allow OpenScreen under System Settings → Privacy & Security → Accessibility, then press record again to start the countdown.";
+				"Allow OpenScreen under System Settings → Privacy & Security → Accessibility, then press record again to start the countdown.";
 			const messageOptions = {
 				type: "warning",
 				buttons: ["Open Accessibility Settings", "Cancel"],
@@ -2657,10 +2753,19 @@ export function registerIpcHandlers(
 						null)
 					: getSelectedDisplay();
 			const bounds = request.source.bounds ?? sourceDisplay?.bounds ?? getSelectedSourceBounds();
+			const captureExcludedWindowSourceIds: string[] = [];
+			if (request.source.type === "display") {
+				for (const window of [getMainWindow(), getNotesWindow()]) {
+					if (window && !window.isDestroyed()) {
+						captureExcludedWindowSourceIds.push(window.getMediaSourceId());
+					}
+				}
+			}
 			const config: NativeMacRecordingRequest = {
 				...request,
 				schemaVersion: 1,
 				recordingId,
+				excludedWindowIds: collectMacCaptureExcludedWindowIds(captureExcludedWindowSourceIds),
 				source: {
 					...request.source,
 					bounds,
@@ -2688,6 +2793,7 @@ export function registerIpcHandlers(
 			console.info("[native-sck] starting macOS capture", {
 				helperPath,
 				source: config.source,
+				excludedWindowIds: config.excludedWindowIds,
 				audio: config.audio,
 				webcam: config.webcam,
 				cursor: config.cursor,
@@ -2723,6 +2829,14 @@ export function registerIpcHandlers(
 
 			await waitForNativeMacCaptureStart(proc);
 			const captureStartedAtMs = Date.now();
+			const microphoneDefaulted =
+				request.audio.microphone.enabled && readMicrophoneDefaulted(nativeMacCaptureOutput);
+			if (microphoneDefaulted) {
+				console.warn("[native-sck] recording the default input; microphone was not resolved", {
+					deviceId: request.audio.microphone.deviceId,
+					deviceName: request.audio.microphone.deviceName,
+				});
+			}
 			nativeMacCursorOffsetMs =
 				cursorCaptureMode === "editable-overlay"
 					? Math.max(0, captureStartedAtMs - cursorStartTimeMs)
@@ -2738,6 +2852,7 @@ export function registerIpcHandlers(
 				recordingId,
 				path: outputPath,
 				helperPath,
+				microphoneDefaulted,
 			};
 		} catch (error) {
 			console.error("Failed to start native macOS recording:", error);
@@ -3371,10 +3486,15 @@ export function registerIpcHandlers(
 					...(cursorCaptureMode ? { cursorCaptureMode } : {}),
 				}
 			: { screenVideoPath, createdAt, ...(cursorCaptureMode ? { cursorCaptureMode } : {}) };
+		// Sidecar BEFORE the session is published, as the three native stop paths already
+		// do it. Publishing first opens a window where `getCurrentRecordingSession` hands
+		// the editor a take whose `.cursor.json` is not on disk yet, and the editor's
+		// fresh-take auto-zoom reads that file the moment it imports -- an empty read there
+		// is indistinguishable from a take with no dwell, so the zooms are silently
+		// skipped.
+		await writePendingCursorTelemetry(screenVideoPath);
 		setCurrentRecordingSessionState(session);
 		currentProjectPath = null;
-
-		await writePendingCursorTelemetry(screenVideoPath);
 
 		const sessionManifestPath = path.join(
 			RECORDINGS_DIR,
@@ -3574,6 +3694,8 @@ export function registerIpcHandlers(
 		}
 	});
 
+	// The media tab imports VIDEO (it arranges clips). Audio is imported from the
+	// timeline toolbar instead (issue #350) — see `open-audio-file-picker` below.
 	ipcMain.handle("open-video-file-picker", async () => {
 		try {
 			const dialogOptions = buildDialogOptions(
@@ -3620,6 +3742,84 @@ export function registerIpcHandlers(
 		}
 	});
 
+	// Import an external audio file (voiceover / BGM / SFX) — issue #350. Driven by
+	// the timeline's "Add audio" tool: audio is a timeline overlay (like an
+	// annotation), not a media-tab clip, so it has its own audio-only picker and the
+	// renderer adds it as a kind:"audio" asset + track at the playhead.
+	ipcMain.handle("open-audio-file-picker", async () => {
+		try {
+			const dialogOptions = buildDialogOptions(
+				{
+					title: mainT("dialogs", "fileDialogs.selectAudio"),
+					defaultPath: RECORDINGS_DIR,
+					filters: [
+						{
+							name: mainT("dialogs", "fileDialogs.audioFiles"),
+							extensions: ["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus"],
+						},
+						{ name: mainT("dialogs", "fileDialogs.allFiles"), extensions: ["*"] },
+					],
+					properties: ["openFile"],
+				},
+				getMainWindow(),
+			);
+			const result = await dialog.showOpenDialog(dialogOptions);
+
+			if (result.canceled || result.filePaths.length === 0) {
+				return { success: false, canceled: true };
+			}
+
+			const normalizedPath = await approveReadableAudioPath(result.filePaths[0]);
+			if (!normalizedPath) {
+				return {
+					success: false,
+					message: "Selected file is not a supported readable audio file",
+				};
+			}
+
+			return {
+				success: true,
+				path: normalizedPath,
+			};
+		} catch (error) {
+			console.error("Failed to open audio file picker:", error);
+			return {
+				success: false,
+				message: "Failed to open audio file picker",
+				error: String(error),
+			};
+		}
+	});
+
+	// In-editor voiceover recording: the renderer hands over the raw MediaRecorder
+	// blob (webm/opus) and gets back the path it landed at, under the recordings
+	// dir so it lives with the project's other media and survives relaunches.
+	ipcMain.handle("save-recorded-voiceover", async (_event, data: ArrayBuffer) => {
+		try {
+			if (!(data instanceof ArrayBuffer) || data.byteLength === 0) {
+				return { success: false, message: "Empty recording" };
+			}
+			// A cap, because this writes renderer-supplied bytes straight to disk. An
+			// hour of Opus is a few tens of MB, so 512 MB is far past any real take
+			// and still refuses a runaway or malformed payload before it is buffered.
+			if (data.byteLength > MAX_RECORDED_VOICEOVER_BYTES) {
+				return { success: false, message: "Recording too large" };
+			}
+			await fs.mkdir(RECORDINGS_DIR, { recursive: true });
+			const fileName = `voiceover-${new Date().toISOString().replace(/[:.]/g, "-")}.webm`;
+			const target = path.join(RECORDINGS_DIR, fileName);
+			await fs.writeFile(target, Buffer.from(data));
+			return { success: true, path: target };
+		} catch (error) {
+			console.error("Failed to save recorded voiceover:", error);
+			return {
+				success: false,
+				message: "Failed to save recorded voiceover",
+				error: String(error),
+			};
+		}
+	});
+
 	ipcMain.handle("reveal-in-folder", async (_, filePath: string) => {
 		try {
 			// showItemInFolder returns nothing, it throws on error
@@ -3645,7 +3845,7 @@ export function registerIpcHandlers(
 
 	ipcMain.handle("read-binary-file", async (_, filePath: string) => {
 		try {
-			const normalizedPath = await approveReadableVideoPath(filePath);
+			const normalizedPath = readableApprovedPath(filePath);
 			if (!normalizedPath) {
 				return {
 					success: false,
@@ -3675,7 +3875,7 @@ export function registerIpcHandlers(
 	// recording above that can never be loaded whole — see read-file-chunk).
 	ipcMain.handle("get-readable-file-info", async (_, filePath: string) => {
 		try {
-			const normalizedPath = await approveReadableVideoPath(filePath);
+			const normalizedPath = readableApprovedPath(filePath);
 			if (!normalizedPath) {
 				return {
 					success: false,
@@ -3711,7 +3911,7 @@ export function registerIpcHandlers(
 		async (_, filePath: string, durationSec: number): Promise<AudioPeaksResult> => {
 			try {
 				// Same approval gate as every other read of a renderer-supplied path.
-				const normalizedPath = await approveReadableVideoPath(filePath);
+				const normalizedPath = readableApprovedPath(filePath);
 				if (!normalizedPath) {
 					return { success: false, message: "File path is not approved" };
 				}
@@ -3735,7 +3935,7 @@ export function registerIpcHandlers(
 	// do (2 GiB cap) and a 16 GB machine cannot hold for multi-GB recordings.
 	ipcMain.handle("read-file-chunk", async (_, filePath: string, offset: number, length: number) => {
 		try {
-			const normalizedPath = await approveReadableVideoPath(filePath);
+			const normalizedPath = readableApprovedPath(filePath);
 			if (!normalizedPath) {
 				return {
 					success: false,
@@ -4164,6 +4364,7 @@ export function registerIpcHandlers(
 	const aiEditionDocuments = new DocumentService(
 		path.join(app.getPath("userData"), "projects"),
 		RECORDINGS_DIR,
+		approveDocumentMedia,
 	);
 
 	// LlmConfigStore is single-instance for a duller reason — its constructor does

@@ -10,6 +10,13 @@ import type { CropRegion } from "@/components/video-editor/types";
 import { useScopedT } from "@/contexts/I18nContext";
 import type { AxcutClip } from "@/lib/ai-edition/schema";
 import { formatSeconds } from "@/lib/ai-edition/timeline/format";
+import {
+	cropDraftFromRegion,
+	cropDraftToPct,
+	displayPct,
+	previewBoxStyle,
+	stepPct,
+} from "./cropDraft";
 import styles from "./NewEditorShell.module.css";
 import type { VideoSource } from "./VirtualPreview";
 
@@ -596,11 +603,19 @@ function CropField({
 	label,
 	value,
 	onChange,
+	step,
 }: {
 	label: string;
 	value: number;
 	onChange: (n: number) => void;
+	step: number;
 }) {
+	// While the field is focused the user's raw text is the value: rendering
+	// `displayPct(value)` on a controlled input would rewrite "25." to "25" on
+	// every keystroke, making decimals untypable. The buffer seeds from the
+	// UNROUNDED stored value so native stepper arrows step from the exact
+	// state, not the rounded display; two-decimal formatting happens on blur.
+	const [draft, setDraft] = useState<string | null>(null);
 	return (
 		<div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }}>
 			<label
@@ -615,10 +630,17 @@ function CropField({
 			</label>
 			<input
 				type="number"
-				value={value}
+				value={draft ?? displayPct(value)}
 				min={0}
 				max={100}
-				onChange={(e) => onChange(Number(e.target.value))}
+				step={step}
+				onFocus={() => setDraft(String(value))}
+				onBlur={() => setDraft(null)}
+				onChange={(e) => {
+					setDraft(e.target.value);
+					const parsed = Number(e.target.value);
+					if (e.target.value !== "" && Number.isFinite(parsed)) onChange(parsed);
+				}}
 				style={{
 					width: "100%",
 					padding: "8px 10px",
@@ -687,6 +709,7 @@ export function EditClipModal({
 	// fraction-of-frame width/height. 16/9 is just a placeholder until the
 	// crop <video>'s real metadata loads (see the effect below).
 	const [videoAspectRatio, setVideoAspectRatio] = useState(16 / 9);
+	const [frameSizePx, setFrameSizePx] = useState({ width: 0, height: 0 });
 	const cropFrameRef = useRef<HTMLDivElement | null>(null);
 	const cropVideoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -698,10 +721,11 @@ export function EditClipModal({
 		setDraftEnd(clip.sourceEndSec ?? clip.sourceStartSec);
 		setActiveEdge(null);
 		const region = clip.cropRegion ?? IDENTITY_CROP;
-		setCropXPct(Math.round(region.x * 100));
-		setCropYPct(Math.round(region.y * 100));
-		setCropWPct(Math.round(region.width * 100));
-		setCropHPct(Math.round(region.height * 100));
+		const pct = cropDraftToPct(cropDraftFromRegion(region));
+		setCropXPct(pct.x);
+		setCropYPct(pct.y);
+		setCropWPct(pct.w);
+		setCropHPct(pct.h);
 		setCropTouched(false);
 	}, [open, clip]);
 
@@ -722,6 +746,14 @@ export function EditClipModal({
 	// clip's original in-point, not on every trim drag.
 	useEffect(() => {
 		if (!open || !clip) return;
+		// A clip switch must not leave the previous clip's dimensions live: an
+		// immediate preset or typed edit would quantize against the wrong
+		// resolution and `cropTouched` would lock the wrong aspect in. Reset to
+		// the same defaults a fresh dialog starts with; the metadata handler
+		// below refills them (immediately, when this clip's metadata is already
+		// loaded).
+		setVideoAspectRatio(16 / 9);
+		setFrameSizePx({ width: 0, height: 0 });
 		const v = cropVideoRef.current;
 		if (!v) return;
 		const seek = () => {
@@ -729,6 +761,7 @@ export function EditClipModal({
 			if (Number.isFinite(clip.sourceStartSec)) v.currentTime = clip.sourceStartSec;
 			if (v.videoWidth > 0 && v.videoHeight > 0) {
 				setVideoAspectRatio(v.videoWidth / v.videoHeight);
+				setFrameSizePx({ width: v.videoWidth, height: v.videoHeight });
 			}
 		};
 		if (v.readyState >= 1) seek();
@@ -785,10 +818,10 @@ export function EditClipModal({
 		// field/handle logic below, keeps every later edit at that ratio).
 		if (!candidate?.ratio) return;
 		const fit = centeredFitPct(candidate.ratio / videoAspectRatio);
-		setCropXPct(Math.round(fit.x));
-		setCropYPct(Math.round(fit.y));
-		setCropWPct(Math.round(fit.w));
-		setCropHPct(Math.round(fit.h));
+		setCropXPct(fit.x);
+		setCropYPct(fit.y);
+		setCropWPct(fit.w);
+		setCropHPct(fit.h);
 	};
 
 	// Fraction-space width/height ratio the crop is locked to while a preset is
@@ -802,11 +835,11 @@ export function EditClipModal({
 	// independently. All keep the rectangle inside the frame.
 	const applyCropX = (v: number) => {
 		setCropTouched(true);
-		setCropXPct(Math.round(clampPct(v, 0, 100 - cropWPct)));
+		setCropXPct(clampPct(v, 0, 100 - cropWPct));
 	};
 	const applyCropY = (v: number) => {
 		setCropTouched(true);
-		setCropYPct(Math.round(clampPct(v, 0, 100 - cropHPct)));
+		setCropYPct(clampPct(v, 0, 100 - cropHPct));
 	};
 	const applyCropW = (v: number) => {
 		setCropTouched(true);
@@ -817,10 +850,10 @@ export function EditClipModal({
 				h = 100 - cropYPct;
 				w = h * lockedFractionRatio;
 			}
-			setCropWPct(Math.round(w));
-			setCropHPct(Math.round(h));
+			setCropWPct(w);
+			setCropHPct(h);
 		} else {
-			setCropWPct(Math.round(clampPct(v, MIN_PCT, 100 - cropXPct)));
+			setCropWPct(clampPct(v, MIN_PCT, 100 - cropXPct));
 		}
 	};
 	const applyCropH = (v: number) => {
@@ -832,10 +865,10 @@ export function EditClipModal({
 				w = 100 - cropXPct;
 				h = w / lockedFractionRatio;
 			}
-			setCropWPct(Math.round(w));
-			setCropHPct(Math.round(h));
+			setCropWPct(w);
+			setCropHPct(h);
 		} else {
-			setCropHPct(Math.round(clampPct(v, MIN_PCT, 100 - cropYPct)));
+			setCropHPct(clampPct(v, MIN_PCT, 100 - cropYPct));
 		}
 	};
 
@@ -853,8 +886,8 @@ export function EditClipModal({
 		const move = (ev: PointerEvent) => {
 			const dxPct = ((ev.clientX - startX) / r.width) * 100;
 			const dyPct = ((ev.clientY - startY) / r.height) * 100;
-			setCropXPct(Math.round(clampPct(start.x + dxPct, 0, 100 - start.w)));
-			setCropYPct(Math.round(clampPct(start.y + dyPct, 0, 100 - start.h)));
+			setCropXPct(clampPct(start.x + dxPct, 0, 100 - start.w));
+			setCropYPct(clampPct(start.y + dyPct, 0, 100 - start.h));
 		};
 		const up = () => {
 			window.removeEventListener("pointermove", move);
@@ -924,10 +957,10 @@ export function EditClipModal({
 				x = fixedLeft ? anchorX : anchorX - w;
 				y = fixedTop ? anchorY : anchorY - h;
 			}
-			setCropXPct(Math.round(x));
-			setCropYPct(Math.round(y));
-			setCropWPct(Math.round(w));
-			setCropHPct(Math.round(h));
+			setCropXPct(x);
+			setCropYPct(y);
+			setCropWPct(w);
+			setCropHPct(h);
 		};
 		const up = () => {
 			window.removeEventListener("pointermove", move);
@@ -951,10 +984,11 @@ export function EditClipModal({
 		setDraftStart(clip.sourceStartSec);
 		setDraftEnd(clip.sourceEndSec ?? clip.sourceStartSec);
 		const region = clip.cropRegion ?? IDENTITY_CROP;
-		setCropXPct(Math.round(region.x * 100));
-		setCropYPct(Math.round(region.y * 100));
-		setCropWPct(Math.round(region.width * 100));
-		setCropHPct(Math.round(region.height * 100));
+		const pct = cropDraftToPct(cropDraftFromRegion(region));
+		setCropXPct(pct.x);
+		setCropYPct(pct.y);
+		setCropWPct(pct.w);
+		setCropHPct(pct.h);
 		setCropRatio(detectRatio(region, videoAspectRatio));
 		setCropTouched(false);
 	};
@@ -979,21 +1013,7 @@ export function EditClipModal({
 			subtitle={assetMeta?.label ?? undefined}
 			wide
 		>
-			<div
-				ref={cropFrameRef}
-				style={{
-					position: "relative",
-					width: "100%",
-					height: 230,
-					maxWidth: 409,
-					margin: "0 auto 14px",
-					flexShrink: 0,
-					background: "#0a0b0e",
-					borderRadius: "var(--r-md)",
-					border: "1px solid var(--border)",
-					overflow: "hidden",
-				}}
-			>
+			<div ref={cropFrameRef} style={previewBoxStyle(videoAspectRatio)}>
 				{cropPreviewSource ? (
 					<video
 						ref={cropVideoRef}
@@ -1200,10 +1220,30 @@ export function EditClipModal({
 						alignItems: "end",
 					}}
 				>
-					<CropField label={t("cropDialog.fieldX")} value={cropXPct} onChange={applyCropX} />
-					<CropField label={t("cropDialog.fieldY")} value={cropYPct} onChange={applyCropY} />
-					<CropField label={t("cropDialog.fieldW")} value={cropWPct} onChange={applyCropW} />
-					<CropField label={t("cropDialog.fieldH")} value={cropHPct} onChange={applyCropH} />
+					<CropField
+						label={t("cropDialog.fieldX")}
+						value={cropXPct}
+						step={stepPct(frameSizePx.width)}
+						onChange={applyCropX}
+					/>
+					<CropField
+						label={t("cropDialog.fieldY")}
+						value={cropYPct}
+						step={stepPct(frameSizePx.height)}
+						onChange={applyCropY}
+					/>
+					<CropField
+						label={t("cropDialog.fieldW")}
+						value={cropWPct}
+						step={stepPct(frameSizePx.width)}
+						onChange={applyCropW}
+					/>
+					<CropField
+						label={t("cropDialog.fieldH")}
+						value={cropHPct}
+						step={stepPct(frameSizePx.height)}
+						onChange={applyCropH}
+					/>
 					<div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 110 }}>
 						<label
 							style={{
@@ -1244,7 +1284,7 @@ export function EditClipModal({
 							whiteSpace: "nowrap",
 						}}
 					>
-						{cropWPct}% × {cropHPct}%
+						{displayPct(cropWPct)}% × {displayPct(cropHPct)}%
 					</span>
 				</div>
 			</div>

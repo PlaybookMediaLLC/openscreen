@@ -71,7 +71,7 @@ export const META = {
 
 /** The transcript pane's header. */
 export const INSPECTOR = {
-	title: "Current transcription",
+	title: "Transcript",
 	indexBadge: "1",
 	filename: "Bellrock — docs walkthrough",
 	clipRange: "Clip 1 · 0:00.0—0:40.0",
@@ -765,7 +765,7 @@ export const TOKENS = {
 
 /** One entry per string on screen. */
 export const PROVENANCE: ProvenanceEntry[] = [
-	{ shown: "Current transcription", source: "src/i18n/locales/en/settings.json → transcript.title" },
+	{ shown: "Transcript", source: "src/i18n/locales/en/settings.json → transcript.title" },
 	{ shown: "Clip 1 · 0:00.0—0:40.0", source: "computed: settings.json transcript.clipLabel with index 1, joined to formatMs(0) and formatMs(40033) from src/lib/ai-edition/timeline/format.ts" },
 	{ shown: "Bellrock — docs walkthrough", source: "fixture assets[0].label" },
 	{ shown: "[silence 2.2s]", source: "computed: settings.json transcript.silence over the 2.190s gap 0–2.19 that buildClipSection inserted at SILENCE_THRESHOLD_SEC 0.2; inside trimRange trim_f52989cf-489c-47f5-a6c7-b95a7d71b399" },
