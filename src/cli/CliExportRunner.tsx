@@ -30,6 +30,7 @@ import { buildAutoZoomSuggestions } from "@/lib/ai-edition/timeline/zoom-suggest
 import type { CliDoneResult, CliExportRequest } from "@/lib/cliContracts";
 import { GIF_SIZE_PRESETS, type GifSizePreset } from "@/lib/exporter";
 import { calculateMp4ExportSettings } from "@/lib/exporter/mp4ExportSettings";
+import { outputFrameCount } from "@/lib/exporter/outputFrameCount";
 import { mixVoiceoverIntoVideo } from "@/lib/exporter/voiceoverMix";
 import { exportGifNative, exportMultiNative, nativeBridgeClient } from "@/native";
 import type { CompositorClipInput } from "@/native/contracts";
@@ -211,6 +212,34 @@ async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 		axcutDocument = applyProbedDuration(axcutDocument, primaryAssetId, probed.durationMs / 1000);
 	}
 
+	// The camera's dimensions decide the PiP's layout box, and this is the one caller the
+	// document cannot answer for: there is no editor session here to have probed and saved
+	// them, so without this the CLI lays the box out from a hardcoded 4:3 and a 16:9 camera
+	// exports framed differently from the same project opened in the app.
+	//
+	// Failure-tolerant on purpose, unlike the screen probe above which is allowed to reject:
+	// a camera file that has gone missing should cost the export its camera, not the export.
+	if (media.webcamVideoPath) {
+		const camera = await probeVideoDimensions(toFileUrl(media.webcamVideoPath)).catch(() => null);
+		if (camera) {
+			axcutDocument = {
+				...axcutDocument,
+				assets: axcutDocument.assets.map((asset) =>
+					asset.cameraTrack
+						? {
+								...asset,
+								cameraTrack: {
+									...asset.cameraTrack,
+									width: camera.width,
+									height: camera.height,
+								},
+							}
+						: asset,
+				),
+			};
+		}
+	}
+
 	if (request.autoZoom) {
 		const added = appendAutoZoomRanges(axcutDocument, cursorTelemetry, probed.durationMs);
 		window.electronAPI.cliLog("info", `Auto-zoom: added ${added} region(s) from cursor telemetry`);
@@ -235,22 +264,23 @@ async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 		aspectRatioValue,
 	});
 
-	const clips = buildNativeClipList(axcutDocument);
-	if (clips.length === 0) {
+	const builtClips = buildNativeClipList(axcutDocument);
+	if (builtClips.length === 0) {
 		throw new Error("The project's timeline has no visible clips to export");
 	}
-	const sceneJson = JSON.stringify(buildSceneDescription(axcutDocument));
+	const sceneDesc = buildSceneDescription(axcutDocument);
+
+	// The webcam background effect is applied by the compositor from the scene, so the clip
+	// list needs no pre-rendering pass.
+	const clips = builtClips;
+	const sceneJson = JSON.stringify(sceneDesc);
 
 	// Progress: native pushes raw encoded-frame counts; totals and pacing are
 	// computed here, mirroring the ExportDialog.
 	const outFps = format === "gif" ? gifFrameRate : MP4_EXPORT_FPS;
-	const totalFrames = Math.max(
-		1,
-		Math.round(
-			clips.reduce((sum, clip) => sum + Math.max(0, clip.sourceEndSec - clip.sourceStartSec), 0) *
-				outFps,
-		),
-	);
+	// Speed-adjusted, not source seconds — see `outputFrameCount`. Counting raw duration
+	// is what made a 1.25x timeline stop the bar at 80% (OpenScreen#371).
+	const totalFrames = outputFrameCount(clips, sceneDesc.speedRegions, outFps);
 	const exportStartedAt = Date.now();
 	const unsubscribeProgress = window.electronAPI.onNativeExportProgress?.((frames: number) => {
 		const elapsedSec = (Date.now() - exportStartedAt) / 1000;
