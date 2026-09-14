@@ -179,6 +179,8 @@ interface Window {
 			session?: import("../src/lib/recordingSession").RecordingSession;
 			message?: string;
 			discarded?: boolean;
+			/** The take ended before it was stopped, but its recording was kept. */
+			warning?: string;
 			error?: string;
 		}>;
 		attachNativeMacWebcamRecording: (payload: {
@@ -317,6 +319,8 @@ interface Window {
 			success: boolean;
 			session?: RecordingSession | null;
 			canceled?: boolean;
+			/** Why this recording ended before it was stopped, when it did. */
+			warning?: string;
 		}>;
 		findRecordingCamera: (videoPath: string) => Promise<{
 			success: boolean;
